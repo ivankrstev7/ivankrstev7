@@ -1,0 +1,305 @@
+USE AdventureWarehouse
+GO
+
+CREATE TABLE Dim_Teritories(
+skey int identity not null primary key,
+teritory_name nvarchar(50) not null,
+ODB_id int
+)
+
+CREATE TABLE Dim_Products(
+skey int identity primary key,
+product_name nvarchar(50) not null,
+product_modelID int,
+ODB_id int
+)
+
+CREATE TABLE Dim_DatesTypes(
+skey int identity primary key,
+order_date datetime not null, -- ne se odenesuva samo na order, tuku i na ship date
+)
+
+CREATE TABLE Dim_ShipType(
+skey int identity primary key,
+name nvarchar(50),
+ODB_id int
+)
+
+
+
+create table fact_Izvestaj0(                                     -- Територија,продукт,датум
+dim_Teritorii_skey int not null references Dim_Teritories(skey),
+dim_Produkti_skey int not null references Dim_Products(skey),
+dim_DatesTypes_skey int not null references Dim_DatesTypes(skey),
+total_sold smallint ,
+total_value decimal
+)
+
+create table fact_Izvestaj1(                                     -- Територија,модел,тип,датум
+dim_Teritorii_skey int not null references Dim_Teritories(skey),
+dim_Produkti_skey int not null references Dim_Products(skey),
+dim_ShipType_skey int not null references Dim_ShipType(skey),
+dim_DatesTypes_skey int not null references Dim_DatesTypes(skey),
+total_sold smallint ,
+total_value decimal
+)
+
+
+CREATE TABLE Status_Table(
+lastUp_Teritories datetime,
+lastUp_Products datetime,
+lastUp_ShipType datetime,
+lastUp_Date datetime,
+lastUp_f0 datetime,
+lastUp_f1 datetime
+)
+GO
+
+
+-- Иницијално пополнување на статус табелата
+-- За сите, освен за Date димензијата, не е важно кој ќе е почетниот датум
+-- За date, ќе го најдеме како минимум датумот кој го содржи табелата минус еден ден, за подоцна 
+-- да може да го користиме во ЕТЛ процесот на date димензијата
+
+
+declare @min_datum datetime;
+set @min_datum = (
+select min(soh.OrderDate)
+from AdventureWorks2012.Sales.SalesOrderHeader soh
+)
+set @min_datum =  dateadd(day,-1,@min_datum)
+truncate table Status_Table
+insert into Status_Table values(
+'2000-01-01 00:00:00.000','2000-01-01 00:00:00.000','2000-01-01 00:00:00.000',
+'2000-01-01 00:00:00.000','2000-01-01 00:00:00.000','2000-01-01 00:00:00.000'
+)
+update Status_Table
+set lastUp_Date = @min_datum
+
+select * from Status_Table
+
+GO
+CREATE PROCEDURE sp_PerformETL_Teritories
+as
+begin
+	set nocount on
+	insert into dim_Teritories(teritory_name,ODB_Id)
+	select st.Name, st.TerritoryID
+	from  AdventureWorks2012.Sales.SalesTerritory st left join Dim_Teritories dt on dt.ODB_Id=st.TerritoryID
+	where dt.skey is NULL
+
+	update Dim_Teritories --vo sluchaj da ima promena na ime na teritorija
+	set teritory_name=st.Name
+	from  AdventureWorks2012.Sales.SalesTerritory st
+	where dim_Teritories.ODB_Id=st.TerritoryID and Dim_Teritories.teritory_name!=st.Name
+
+	update Status_Table
+	set lastUp_Teritories = getdate() 
+end
+go
+
+
+CREATE PROCEDURE sp_PerformETL_DatesTypes
+as
+begin
+
+	if object_id('tempdb.dbo.#tmp_date') is not null drop table #temp_date
+	create table #temp_date(skey int identity , datum date)
+
+	declare @last datetime
+	set @last = (select lastUp_Date from Status_Table)
+
+	insert into #temp_date
+	select distinct soh.OrderDate
+	from  AdventureWorks2012.Sales.SalesOrderHeader soh
+	where soh.OrderDate > @last
+	union
+	select distinct soh.OrderDate
+	from  AdventureWorks2012.Sales.SalesOrderHeader soh
+	where soh.ShipDate > @last
+
+	set nocount on
+	insert into dim_DatesTypes(order_date)
+	select t.datum
+	from  #temp_date t left join Dim_DatesTypes dt on dt.order_date =t.datum
+	where dt.skey is NULL
+
+
+	update Status_Table
+	set lastUp_Date = (select MAX(order_date) from Dim_DatesTypes) 
+end
+go
+
+Create procedure sp_PerformETL_Products
+as
+begin
+
+set nocount on
+insert into Dim_Products
+select p.Name,pm.ProductModelID,p.ProductID
+from AdventureWorks2012.Production.Product p inner join AdventureWorks2012.Production.ProductModel pm on p.ProductModelID = pm.ProductModelID 
+left outer join Dim_Products dp on p.ProductID = dp.ODB_id
+where dp.skey is null
+
+update Status_Table
+	set lastUp_Products = getdate() 
+end
+go
+
+create procedure sp_PerformETL_ShipType
+as
+begin
+
+set nocount on
+insert into Dim_ShipType
+select sm.Name,soh.SalesOrderID
+from AdventureWorks2012.Sales.SalesOrderHeader soh inner join AdventureWorks2012.Purchasing.ShipMethod sm on soh.ShipMethodID = sm.ShipMethodID  
+left join Dim_ShipType st on soh.SalesOrderID = st.ODB_id
+where st.skey is null
+
+update Status_Table
+set lastUp_ShipType = getdate() 
+
+end
+go
+
+create table fact_Izvestaj0_temp(                                     -- Територија,продукт,датум
+dim_Teritorii_skey int not null references Dim_Teritories(skey),
+dim_Produkti_skey int not null references Dim_Products(skey),
+dim_DatesTypes_skey int not null references Dim_DatesTypes(skey),
+total_sold smallint ,
+total_value decimal
+)
+
+go
+
+create procedure sp_PerformETL_FactIzveshtaj0
+as
+begin
+
+if object_id('tempdb.dbo.#temp1') is not null drop table #temp1
+
+select soh.TerritoryID teritory, sod.ProductID product, soh.OrderDate OrderDate, sod.OrderQty Quantity, sod.LineTotal LineTotal
+into #temp1
+from AdventureWorks2012.Sales.SalesOrderHeader soh inner join AdventureWorks2012.Sales.SalesOrderDetail sod
+on soh.SalesOrderID = sod.SalesOrderID
+
+;with cte as(
+select #temp1.teritory,#temp1.product,#temp1.orderDate, sum(#temp1.Quantity) Quantity_Total,sum(#temp1.LineTotal) LineTotal_Total
+from #temp1 
+group by #temp1.teritory,#temp1.product,#temp1.orderDate
+)
+insert into fact_Izvestaj0_temp
+select dt.skey,dp.skey,d.skey,sum(Quantity_Total) Quantity_Total,sum(LineTotal_Total)LineTotal_Total
+from #temp1 t inner join cte on cte.teritory=t.teritory and cte.product=t.product and cte.orderDate=t.OrderDate 
+left outer join Dim_Teritories dt on t.teritory = dt.ODB_id
+left outer join Dim_Products dp on t.product = dp.ODB_id
+left outer join Dim_DatesTypes d on t.orderDate = d.order_date
+group by dt.skey,dp.skey,d.skey
+
+update Status_Table
+set lastUp_f0 = getdate()
+
+BEGIN TRANSACTION SwapTablesForETL  
+		WITH MARK N'SwapTablesForETL';  
+
+	EXEC sp_rename 'fact_Izvestaj0', 'fact_Izvestaj0_old';
+	EXEC sp_rename 'fact_Izvestaj0_temp', 'fact_Izvestaj0';
+	EXEC sp_rename 'fact_Izvestaj0_old', 'fact_Izvestaj0_temp';
+
+
+	-- Rollback the transaction if there were any errors
+	IF @@ERROR <> 0
+	 BEGIN
+		-- Rollback the transaction
+		ROLLBACK
+
+		-- Raise an error and return
+		RAISERROR ('Something happened, IDK what (:/).', 16, 1)
+		RETURN
+	 END
+
+
+end 
+go
+
+create table fact_Izvestaj1_temp(                                     -- Територија,модел,тип,датум
+dim_Teritorii_skey int not null references Dim_Teritories(skey),
+dim_Produkti_skey int not null references Dim_Products(skey),
+dim_ShipType_skey int not null references Dim_ShipType(skey),
+dim_DatesTypes_skey int not null references Dim_DatesTypes(skey),
+total_sold smallint ,
+total_value decimal
+)
+go
+
+create procedure sp_PerformETL_FactIzveshtaj1
+as
+begin
+
+if object_id('tempdb.dbo.#temp2') is not null drop table #temp2
+
+select soh.TerritoryID teritory, p.ProductModelID product_model, sm.Name ship_model, soh.ShipDate ship_date,sod.OrderQty Quantity, sod.LineTotal LineTotal
+into #temp2
+from AdventureWorks2012.Sales.SalesOrderHeader soh inner join AdventureWorks2012.Sales.SalesOrderDetail sod
+on soh.SalesOrderID = sod.SalesOrderID
+inner join AdventureWorks2012.Production.Product p on sod.ProductID = p.ProductID inner join
+AdventureWorks2012.Purchasing.ShipMethod sm on sm.ShipMethodID = soh.ShipMethodID
+
+
+;with cte as(
+select #temp2.teritory,#temp2.product_model,#temp2.ship_model ship_model,#temp2.ship_date, sum(#temp2.Quantity) Quantity_Total,sum(#temp2.LineTotal) LineTotal_Total
+from #temp2 
+group by #temp2.teritory,#temp2.product_model,#temp2.ship_model,#temp2.ship_date
+)
+insert into fact_Izvestaj1_temp
+select dt.skey,dp.skey,ds.skey,d.skey,sum(Quantity_Total) Quantity_Total,sum(LineTotal_Total)LineTotal_Total
+from #temp2 t inner join cte on cte.teritory=t.teritory and cte.product_model=t.product_model and cte.ship_model=t.ship_model
+and cte.ship_date = t.ship_date
+left outer join Dim_Teritories dt on t.teritory = dt.ODB_id
+left outer join Dim_Products dp on t.product_model = dp.product_modelID
+left outer join Dim_ShipType ds on t.ship_model = ds.name
+left outer join Dim_DatesTypes d on t.ship_date = d.order_date
+group by dt.skey,dp.skey,ds.skey,d.skey
+
+update Status_Table
+set lastUp_f1 = getdate()
+
+BEGIN TRANSACTION SwapTablesForETL  
+		WITH MARK N'SwapTablesForETL';  
+
+	EXEC sp_rename 'fact_Izvestaj1', 'fact_Izvestaj1_old';
+	EXEC sp_rename 'fact_Izvestaj1_temp', 'fact_Izvestaj1';
+	EXEC sp_rename 'fact_Izvestaj1_old', 'fact_Izvestaj1_temp';
+
+
+	-- Rollback the transaction if there were any errors
+	IF @@ERROR <> 0
+	 BEGIN
+		-- Rollback the transaction
+		ROLLBACK
+
+		-- Raise an error and return
+		RAISERROR ('Something happened, IDK what (:/).', 16, 1)
+		RETURN
+	 END
+
+
+end 
+go
+
+CREATE PROCEDURE sp_ETL
+as
+begin
+	set nocount on
+	exec sp_PerformETL_Teritories
+	exec sp_PerformETL_Products
+	exec sp_PerformETL_DatesTypes
+	exec sp_PerformETL_ShipType
+	exec sp_PerformETL_FactIzveshtaj0
+	exec sp_PerformETL_FactIzveshtaj1
+end
+
+go
+
+exec dbo.sp_ETL
